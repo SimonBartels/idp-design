@@ -1,9 +1,9 @@
-import pdb
+#import pdb
 import numpy as onp
-import pandas as pd
+#import pandas as pd
 import itertools
-import matplotlib.pyplot as plt
-import seaborn as sns
+#import matplotlib.pyplot as plt
+#import seaborn as sns
 from tqdm import tqdm
 import argparse
 from pathlib import Path
@@ -26,8 +26,11 @@ import idp_design.observable as observable
 
 jax.config.update("jax_enable_x64", True)
 
+# TODO: COMMENT!
+#jax.config.update('jax_disable_jit', True)
 
-checkpoint_every = 50
+
+checkpoint_every = 5 #50
 scan = checkpoint.get_scan(checkpoint_every)
 
 def get_alba_rg(pseq, nsamples, key):
@@ -43,9 +46,7 @@ def get_alba_rg(pseq, nsamples, key):
 
 def run(args):
 
-    minimize_rg = args['minimize_rg']
-    maximize_rg = args['maximize_rg']
-    assert(not (minimize_rg and maximize_rg))
+    minimize_rg = True
 
     key = random.PRNGKey(args['key'])
 
@@ -64,7 +65,6 @@ def run(args):
     gamma = args['gamma']
     out_box_size = args['out_box_size']
     seq_length = args['seq_length']
-    target_rg = args['target_rg']
 
     n_iters = args['n_iters']
     lr = args['lr']
@@ -76,12 +76,24 @@ def run(args):
     gumbel_start = args['gumbel_start']
     gumbel_temps = onp.linspace(gumbel_start, gumbel_end, n_iters)
 
+    #AA = ["MET", "GLY", "LYS", "THR", "ARG", "ALA", "ASP", "GLU", "TYR", "VAL", "LEU", "GLN", "TRP", "PHE", "SER",
+    #      "HIS", "ASN", "PRO", "CYS", "ILE"]
+    AA = "MGKTRADEYVLQWFSHNPCI"
+    AA = {AA[i]: i for i in range(len(AA))}
+    first_domain = jax.numpy.array([AA[a] for a in "GEFTQSVSRLQSIVAGLKNAPSDQLINIFESCVRNPVENIMKILKGIGETFCQHYTQSTDEQPGSHIDFAVNRLKLAEILYYKILETVMVQETRRLHGMDMSVLLEQDIFHRSLMACCLEIVLFAYSSPRTFPWIIEVLNLQPFYFYKVIEVVIRSEEGLSRDMVKHLNSIEEQILESLAWSHDSALWEALQVSANKVPTCEEVIFPNNFETGNNRPKRTGSLALFYRKVYHLASVRLRDLCLKLDVSNELRRKIWTCFEFTLVHCPDLMKDRHLDQLLLCAFYIMAKVTKEERTFQEIMKSYRNQPQANSHVYRSVLLKSIKEERGDLIKFYNTIYVGRVKSFALK"])
+    second_domain = jax.numpy.array([AA[a] for a in "LYCYEQENDS"])
+    #first_domain = jax.numpy.array([AA[a] for a in "FALK"])
+    #second_domain = jax.numpy.array([AA[a] for a in "LYCYEQENDS"])
 
-    def normalize(logits, temp, norm_key):
-        gumbel_weights = jax.random.gumbel(norm_key, logits.shape)
+
+    p0 = jax.nn.one_hot(first_domain, len(AA))
+    p1 = jax.nn.one_hot(second_domain, len(AA))
+
+    def logits_to_full_prob(logits, temp, norm_key):
+        #gumbel_weights = jax.random.gumbel(norm_key, logits.shape)
         # pseq = jax.nn.softmax((logits + gumbel_weights) / temp)
         pseq = jax.nn.softmax(logits / temp)
-
+        pseq = jax.numpy.concatenate([p0, pseq, p1], axis=0)
         return pseq
 
     output_basedir = Path(args['output_basedir'])
@@ -109,10 +121,15 @@ def run(args):
     with open(run_dir / "params.txt", "w+") as f:
         f.write(params_str)
 
+    init_logits = onp.full((seq_length, 20), 100.0)
+    # init_logits = onp.full((seq_length, 20), 1000.0)
+    init_logits = jnp.array(init_logits, dtype=jnp.float64)
+    p_size = logits_to_full_prob(init_logits, 1., None).shape[0]
 
-    bonded_nbrs = jnp.array([(i, i+1) for i in range(seq_length-1)])
+
+    bonded_nbrs = jnp.array([(i, i+1) for i in range(p_size-1)])
     unbonded_nbrs = list()
-    for pair in itertools.combinations(jnp.arange(seq_length), 2):
+    for pair in itertools.combinations(jnp.arange(p_size), 2):
         unbonded_nbrs.append(pair)
     unbonded_nbrs = jnp.array(unbonded_nbrs)
 
@@ -165,15 +182,18 @@ def run(args):
         sample_keys = random.split(ref_key, n_sims)
         sample_trajs = vmap(sample_fn, (0, 0, None, None))(sample_keys, eq_states, pseq, mass)
 
-        sample_traj = sample_trajs.reshape(-1, seq_length, 3)
+        sample_traj = sample_trajs.reshape(-1, p_size, 3)
         return sample_traj
 
+    #objective_func = observable.end_to_end_dist
+    # TODO: make the residues arguments!!!
+    objective_func = observable.dist_factory(296, -7)
 
     res_masses = utils.masses
     def get_ref_states(params, i, R, iter_key, temp):
         curr_logits = params['logits']
         iter_key, norm_key = random.split(iter_key)
-        curr_pseq = normalize(curr_logits, temp, norm_key)
+        curr_pseq = logits_to_full_prob(curr_logits, temp, norm_key)
 
         iter_dir = ref_traj_dir / f"iter{i}"
         iter_dir.mkdir(parents=False, exist_ok=False)
@@ -189,11 +209,17 @@ def run(args):
 
         utils.dump_pos(sample_traj, iter_dir / "traj.pos", box_size=out_box_size)
 
-        sample_rgs = vmap(observable.rg, (0, None, None))(sample_traj, curr_mass, displacement_fn)
+        sample_rgs = vmap(objective_func, (0, None))(sample_traj, displacement_fn)
         mean_rg = onp.mean(sample_rgs)
 
         sample_energies = mapped_energy_fn(sample_traj, curr_pseq)
 
+        # Get ALBATROSS avg.
+        iter_key, alba_key = random.split(iter_key)
+        nsamples = 1000
+        #alba_mean_rg, alba_rgs = get_alba_rg(curr_pseq, nsamples, alba_key)
+
+        return sample_traj, sample_energies, jnp.array(sample_rgs), mean_rg, None #alba_mean_rg
 
         plt.plot(sample_rgs)
         plt.savefig(iter_dir / "rg_traj.png")
@@ -242,7 +268,7 @@ def run(args):
         logits = params['logits']
         # pseq = jax.nn.softmax(logits)
         loss_key, norm_key = random.split(loss_key)
-        pseq = normalize(logits, temp, norm_key)
+        pseq = logits_to_full_prob(logits, temp, norm_key)
 
         energy_scan_fn = lambda state, ts: (None, energy_fn(ts, pseq=pseq))
         _, new_energies = scan(energy_scan_fn, None, ref_states)
@@ -252,23 +278,11 @@ def run(args):
         weighted_rgs = weights * ref_rgs # element-wise multiplication
         expected_rg = jnp.sum(weighted_rgs)
 
-
-        if maximize_rg:
-            loss = -jnp.sqrt((expected_rg)**2)
-        elif minimize_rg:
-            loss = jnp.sqrt((expected_rg)**2)
-        else:
-            mse = (expected_rg - target_rg)**2
-            rmse = jnp.sqrt(mse)
-            loss = rmse
+        loss = jnp.sqrt((expected_rg)**2)
 
         return loss, (n_eff, expected_rg, pseq)
     grad_fn = value_and_grad(loss_fn, has_aux=True)
     grad_fn = jit(grad_fn)
-
-    init_logits = onp.full((seq_length, 20), 100.0)
-    # init_logits = onp.full((seq_length, 20), 1000.0)
-    init_logits = jnp.array(init_logits, dtype=jnp.float64)
 
     # Setup the optimization
     params = {"logits": init_logits}
@@ -277,7 +291,7 @@ def run(args):
 
     R_init = list()
     init_spring_r0 = utils.spring_r0
-    for i in range(seq_length):
+    for i in range(p_size):
         R_init.append([out_box_size/2, out_box_size/2, out_box_size/2+init_spring_r0*i])
     R_init = jnp.array(R_init)
 
@@ -336,13 +350,13 @@ def run(args):
             with open(ref_iter_path, "a") as f:
                 f.write(f"{i}\n")
 
-            plt.scatter(all_ref_iters, all_ref_rgs, color="red", label="Pseq")
-            plt.plot(all_ref_iters, all_ref_rgs, linestyle="--", color="red")
-            plt.scatter(all_ref_iters, all_ref_alba_rgs, color="green", label="ALBATROSS")
-            plt.plot(all_ref_iters, all_ref_alba_rgs, linestyle="--", color="green")
-            plt.legend()
-            plt.savefig(img_dir / f"convergence_i{i}.png")
-            plt.clf()
+            # plt.scatter(all_ref_iters, all_ref_rgs, color="red", label="Pseq")
+            # plt.plot(all_ref_iters, all_ref_rgs, linestyle="--", color="red")
+            # plt.scatter(all_ref_iters, all_ref_alba_rgs, color="green", label="ALBATROSS")
+            # plt.plot(all_ref_iters, all_ref_alba_rgs, linestyle="--", color="green")
+            # plt.legend()
+            # plt.savefig(img_dir / f"convergence_i{i}.png")
+            # plt.clf()
 
             (loss, aux), grads = grad_fn(params, ref_states, ref_energies, ref_rgs, gumbel_temps[i], loss_key)
         (n_eff, expected_rg, pseq) = aux
@@ -363,9 +377,9 @@ def run(args):
         with open(rg_path, "a") as f:
             f.write(f"{expected_rg}\n")
         key, alba_key = random.split(key)
-        curr_alba_rg, _ = get_alba_rg(pseq, 1000, alba_key)
-        with open(alba_rg_path, "a") as f:
-            f.write(f"{curr_alba_rg}\n")
+        # curr_alba_rg, _ = get_alba_rg(pseq, 1000, alba_key)
+        # with open(alba_rg_path, "a") as f:
+        #     f.write(f"{curr_alba_rg}\n")
 
         all_rgs.append(expected_rg)
 
@@ -384,19 +398,19 @@ def run(args):
         with open(argmax_seq_scaled_path, "a") as f:
             f.write(f"{argmax_seq_scaled}\n")
 
-        if i % plot_every == 0 and i:
-            entropies = jnp.mean(jsp.special.entr(pseq), axis=1)
-            plt.bar(jnp.arange(pseq.shape[0]), entropies)
-            plt.savefig(img_dir / f"entropies_i{i}.png")
-            plt.clf()
-
-            plt.plot(all_rgs)
-            plt.xlabel("Iteration")
-            plt.ylabel("Rg")
-            plt.axhline(y=target_rg, linestyle='--', label="Target Rg", color='red')
-            plt.legend()
-            plt.savefig(img_dir / f"rg_i{i}.png")
-            plt.clf()
+        # if i % plot_every == 0 and i:
+        #     entropies = jnp.mean(jsp.special.entr(pseq), axis=1)
+        #     # plt.bar(jnp.arange(pseq.shape[0]), entropies)
+        #     # plt.savefig(img_dir / f"entropies_i{i}.png")
+        #     # plt.clf()
+        #     #
+        #     # plt.plot(all_rgs)
+        #     # plt.xlabel("Iteration")
+        #     # plt.ylabel("Rg")
+        #     # plt.axhline(y=0, linestyle='--', label="Target Rg", color='red')
+        #     # plt.legend()
+        #     # plt.savefig(img_dir / f"rg_i{i}.png")
+        #     # plt.clf()
 
 
         print(f"Loss: {loss}")
@@ -412,7 +426,7 @@ def run(args):
     obj_dir.mkdir(parents=False, exist_ok=False)
     onp.save(obj_dir / "ref_iters.npy", onp.array(all_ref_iters), allow_pickle=False)
     onp.save(obj_dir / "ref_rgs.npy", onp.array(all_ref_rgs), allow_pickle=False)
-    onp.save(obj_dir / "ref_alba_rgs.npy", onp.array(all_ref_alba_rgs), allow_pickle=False)
+    #onp.save(obj_dir / "ref_alba_rgs.npy", onp.array(all_ref_alba_rgs), allow_pickle=False)
 
 def get_parser():
 
@@ -442,6 +456,29 @@ def get_parser():
                         help="End temperature for gumbel softmax")
 
     # Simulation arguments
+    # parser.add_argument('--key', type=int, default=0)
+    # parser.add_argument('--out-box-size', type=float, default=200.0,
+    #                     help="Length of the box for injavis visualization")
+    # parser.add_argument('--n-sims', type=int, default=2,
+    #                     help="Number of independent simulations")
+    # parser.add_argument('--n-eq-steps', type=int, default=10,
+    #                     help="Number of equilibration steps")
+    # parser.add_argument('--n-sample-steps', type=int, default=50,
+    #                     help="Number of steps from which to sample states")
+    # parser.add_argument('--sample-every', type=int, default=5,
+    #                     help="Frequency of sampling reference states.")
+    # parser.add_argument('--kt', type=float, default=300*utils.kb,
+    #                     help="Temperature")
+    # parser.add_argument('--dt', type=float, default=0.2,
+    #                     help="Time step")
+    # parser.add_argument('--gamma', type=float, default=0.001,
+    #                     help="Friction coefficient for Langevin integrator")
+    #
+    # parser.add_argument('--maximize-rg', action='store_true',
+    #                     help="If true, just try to maximize Rg")
+    # parser.add_argument('--minimize-rg', action='store_true',
+    #                     help="If true, just try to minimize Rg")
+    # Simulation arguments
     parser.add_argument('--key', type=int, default=0)
     parser.add_argument('--out-box-size', type=float, default=200.0,
                         help="Length of the box for injavis visualization")
@@ -464,7 +501,6 @@ def get_parser():
                         help="If true, just try to maximize Rg")
     parser.add_argument('--minimize-rg', action='store_true',
                         help="If true, just try to minimize Rg")
-
 
     return parser
 

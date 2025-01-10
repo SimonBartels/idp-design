@@ -22,5 +22,12 @@ def rg(R, mass, displacement_fn):
 
 
 def end_to_end_dist(R, displacement_fn):
-    e2e_dist = space.distance(displacement_fn(R[0], R[-1]))
+    e2e_dist = space.distance(displacement_fn(R[296], R[366]))
     return e2e_dist
+
+
+def dist_factory(i, j):
+    def end_to_end_dist(R, displacement_fn):
+        e2e_dist = space.distance(displacement_fn(R[i], R[j]))
+        return e2e_dist
+    return end_to_end_dist
