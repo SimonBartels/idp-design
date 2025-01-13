@@ -1,4 +1,6 @@
 #import pdb
+import shutil
+
 import numpy as onp
 #import pandas as pd
 import itertools
@@ -19,10 +21,12 @@ from jax import vmap, jit, value_and_grad, lax, random
 from jax_md import space, simulate
 import optax
 
-from idp_design.energy_prob import get_energy_fn
+from idp_design import rigid_utils
+from idp_design.rigid_energy_prob import get_energy_fn
 import idp_design.utils as utils
 import idp_design.checkpoint as checkpoint
 import idp_design.observable as observable
+from idp_design.rigid_utils import get_intra_distances
 
 jax.config.update("jax_enable_x64", True)
 
@@ -80,24 +84,33 @@ def run(args):
     #      "HIS", "ASN", "PRO", "CYS", "ILE"]
     AA = "MGKTRADEYVLQWFSHNPCI"
     AA = {AA[i]: i for i in range(len(AA))}
-    first_domain = jax.numpy.array([AA[a] for a in "GEFTQSVSRLQSIVAGLKNAPSDQLINIFESCVRNPVENIMKILKGIGETFCQHYTQSTDEQPGSHIDFAVNRLKLAEILYYKILETVMVQETRRLHGMDMSVLLEQDIFHRSLMACCLEIVLFAYSSPRTFPWIIEVLNLQPFYFYKVIEVVIRSEEGLSRDMVKHLNSIEEQILESLAWSHDSALWEALQVSANKVPTCEEVIFPNNFETGNNRPKRTGSLALFYRKVYHLASVRLRDLCLKLDVSNELRRKIWTCFEFTLVHCPDLMKDRHLDQLLLCAFYIMAKVTKEERTFQEIMKSYRNQPQANSHVYRSVLLKSIKEERGDLIKFYNTIYVGRVKSFALK"])
-    second_domain = jax.numpy.array([AA[a] for a in "LYCYEQENDS"])
-    #first_domain = jax.numpy.array([AA[a] for a in "FALK"])
-    #second_domain = jax.numpy.array([AA[a] for a in "LYCYEQENDS"])
+    first_domain_seq = "GEFTQSVSRLQSIVAGLKNAPSDQLINIFESCVRNPVENIMKILKGIGETFCQHYTQSTDEQPGSHIDFAVNRLKLAEILYYKILETVMVQETRRLHGMDMSVLLEQDIFHRSLMACCLEIVLFAYSSPRTFPWIIEVLNLQPFYFYKVIEVVIRSEEGLSRDMVKHLNSIEEQILESLAWSHDSALWEALQVSANKVPTCEEVIFPNNFETGNNRPKRTGSLALFYRKVYHLASVRLRDLCLKLDVSNELRRKIWTCFEFTLVHCPDLMKDRHLDQLLLCAFYIMAKVTKEERTFQEIMKSYRNQPQANSHVYRSVLLKSIKEERGDLIKFYNTIYVGRVKSFALK"
+    first_domain_seq = "FALK"
+    second_domain_seq = "LYCYEQENDS"
+    first_domain = jax.numpy.array([AA[a] for a in first_domain_seq])
+    second_domain = jax.numpy.array([AA[a] for a in second_domain_seq])
+    full_seq_length = len(first_domain) + seq_length + len(second_domain)
 
-
-    p0 = jax.nn.one_hot(first_domain, len(AA))
-    p1 = jax.nn.one_hot(second_domain, len(AA))
+    # TODO: the mass distribution is probably problematic!!!
+    # TODO: maybe there is a way around by placing the three particles s.t. they would actually have a third of the mass...
+    mass_domain_one = jnp.sum(utils.get_seq_mass(first_domain_seq)) / 3 * jnp.ones(3)
+    mass_domain_two = jnp.sum(utils.get_seq_mass(second_domain_seq)) / 3 * jnp.ones(3)
 
     def logits_to_full_prob(logits, temp, norm_key):
         #gumbel_weights = jax.random.gumbel(norm_key, logits.shape)
         # pseq = jax.nn.softmax((logits + gumbel_weights) / temp)
         pseq = jax.nn.softmax(logits / temp)
-        pseq = jax.numpy.concatenate([p0, pseq, p1], axis=0)
         return pseq
 
     output_basedir = Path(args['output_basedir'])
     run_dir = output_basedir / run_name
+
+    if run_name == "bla":
+        try:
+            shutil.rmtree(run_dir)
+        except:
+            pass
+
     run_dir.mkdir(parents=False, exist_ok=False)
 
     ref_traj_dir = run_dir / "ref_traj"
@@ -124,23 +137,52 @@ def run(args):
     init_logits = onp.full((seq_length, 20), 100.0)
     # init_logits = onp.full((seq_length, 20), 1000.0)
     init_logits = jnp.array(init_logits, dtype=jnp.float64)
-    p_size = logits_to_full_prob(init_logits, 1., None).shape[0]
+    #p_size = seq_length + 3 * 2
+    # TODO: maybe generalize to more particles?
+    num_particles = seq_length + 2 * 3
 
+    # TODO: here I need to exclude the residues in the same domain
+    #bonded_nbrs = jnp.array([(i, i+1) for i in range(p_size-1)])
+    bonded_nbrs = jnp.array([(i, i + 1) for i in range(len(first_domain), len(first_domain) + seq_length)])
 
-    bonded_nbrs = jnp.array([(i, i+1) for i in range(p_size-1)])
     unbonded_nbrs = list()
-    for pair in itertools.combinations(jnp.arange(p_size), 2):
-        unbonded_nbrs.append(pair)
+    # for pair in itertools.combinations(jnp.arange(p_size), 2):
+    #     unbonded_nbrs.append(pair)
+    for j in range(len(first_domain)):
+        unbonded_nbrs = unbonded_nbrs + [(j, i) for i in range(len(first_domain), full_seq_length)]
+    for j in range(len(first_domain), seq_length):
+        unbonded_nbrs = unbonded_nbrs + [(j, i) for i in range(j+1, full_seq_length)]
     unbonded_nbrs = jnp.array(unbonded_nbrs)
 
     unbonded_nbrs_set = set([tuple(pr) for pr in onp.array(unbonded_nbrs)])
     bonded_nbrs_set = set([tuple(pr) for pr in onp.array(bonded_nbrs)])
     unbonded_nbrs = jnp.array(list(unbonded_nbrs_set - bonded_nbrs_set))
 
-
     displacement_fn, shift_fn = space.free()
 
-    subterms_fn, energy_fn = get_energy_fn(bonded_nbrs, unbonded_nbrs, displacement_fn)
+    R_init = list()
+    # TODO: here use initial PDB?
+    init_spring_r0 = utils.spring_r0
+    # TODO: since the particles are on a line, probably this will cause problems to define a reference frame
+    for i in range(seq_length + 3 * 2):
+        R_init.append([out_box_size/2, out_box_size/2, out_box_size/2+init_spring_r0*i])
+    R_init = jnp.array(R_init)
+
+    domain_particle_indices = [0, 13]
+    domain_particle_initial_intra_distances = [get_intra_distances(R_init[ids:ids+3, :], displacement_fn) for ids in domain_particle_indices]
+    domain_sequences = [first_domain, second_domain]
+    # TODO: replace by (relative) PDB coordinates
+    domain_coordinates = [jnp.concatenate([R_init[ids:ids+3, :], jnp.ones([1, 3])], axis=0) for ids in domain_particle_indices]
+    domains = dict(domain_particle_indices=domain_particle_indices,
+                   domain_particle_initial_intra_distances=domain_particle_initial_intra_distances,
+                   domain_sequences=domain_sequences,
+                   domain_coordinates=domain_coordinates)
+    # domains = {
+    #     (0, 1, 2): (first_domain, R_init[:2, ...]),
+    #     (-3, -2, -1): (second_domain, R_init[-3:, ...])
+    # }
+
+    subterms_fn, energy_fn = get_energy_fn(bonded_nbrs, unbonded_nbrs, domains, displacement_fn)
     energy_fn = jit(energy_fn)
     mapped_energy_fn = vmap(energy_fn, (0, None)) # To evaluate a set of states for a given pseq
 
@@ -182,7 +224,7 @@ def run(args):
         sample_keys = random.split(ref_key, n_sims)
         sample_trajs = vmap(sample_fn, (0, 0, None, None))(sample_keys, eq_states, pseq, mass)
 
-        sample_traj = sample_trajs.reshape(-1, p_size, 3)
+        sample_traj = sample_trajs.reshape(-1, num_particles, 3)
         return sample_traj
 
     #objective_func = observable.end_to_end_dist
@@ -199,6 +241,7 @@ def run(args):
         iter_dir.mkdir(parents=False, exist_ok=False)
 
         curr_mass = utils.get_pseq_mass(curr_pseq, res_masses=res_masses)
+        curr_mass = jnp.concatenate([mass_domain_one, curr_mass, mass_domain_two])
 
         iter_key, batch_key = random.split(iter_key)
         start = time.time()
@@ -289,12 +332,6 @@ def run(args):
     params = {"logits": init_logits}
     optimizer = optax.adam(learning_rate=lr)
     opt_state = optimizer.init(params)
-
-    R_init = list()
-    init_spring_r0 = utils.spring_r0
-    for i in range(p_size):
-        R_init.append([out_box_size/2, out_box_size/2, out_box_size/2+init_spring_r0*i])
-    R_init = jnp.array(R_init)
 
     all_ref_iters = list()
     all_ref_rgs = list()
@@ -457,29 +494,29 @@ def get_parser():
                         help="End temperature for gumbel softmax")
 
     # Simulation arguments
-    # parser.add_argument('--key', type=int, default=0)
-    # parser.add_argument('--out-box-size', type=float, default=200.0,
-    #                     help="Length of the box for injavis visualization")
-    # parser.add_argument('--n-sims', type=int, default=2,
-    #                     help="Number of independent simulations")
-    # parser.add_argument('--n-eq-steps', type=int, default=10,
-    #                     help="Number of equilibration steps")
-    # parser.add_argument('--n-sample-steps', type=int, default=50,
-    #                     help="Number of steps from which to sample states")
-    # parser.add_argument('--sample-every', type=int, default=5,
-    #                     help="Frequency of sampling reference states.")
-    # parser.add_argument('--kt', type=float, default=300*utils.kb,
-    #                     help="Temperature")
-    # parser.add_argument('--dt', type=float, default=0.2,
-    #                     help="Time step")
-    # parser.add_argument('--gamma', type=float, default=0.001,
-    #                     help="Friction coefficient for Langevin integrator")
-    #
-    # parser.add_argument('--maximize-rg', action='store_true',
-    #                     help="If true, just try to maximize Rg")
-    # parser.add_argument('--minimize-rg', action='store_true',
-    #                     help="If true, just try to minimize Rg")
-    # return parser
+    parser.add_argument('--key', type=int, default=0)
+    parser.add_argument('--out-box-size', type=float, default=200.0,
+                        help="Length of the box for injavis visualization")
+    parser.add_argument('--n-sims', type=int, default=2,
+                        help="Number of independent simulations")
+    parser.add_argument('--n-eq-steps', type=int, default=10,
+                        help="Number of equilibration steps")
+    parser.add_argument('--n-sample-steps', type=int, default=50,
+                        help="Number of steps from which to sample states")
+    parser.add_argument('--sample-every', type=int, default=5,
+                        help="Frequency of sampling reference states.")
+    parser.add_argument('--kt', type=float, default=300*utils.kb,
+                        help="Temperature")
+    parser.add_argument('--dt', type=float, default=0.2,
+                        help="Time step")
+    parser.add_argument('--gamma', type=float, default=0.001,
+                        help="Friction coefficient for Langevin integrator")
+
+    parser.add_argument('--maximize-rg', action='store_true',
+                        help="If true, just try to maximize Rg")
+    parser.add_argument('--minimize-rg', action='store_true',
+                        help="If true, just try to minimize Rg")
+    return parser
     # Simulation arguments
     parser.add_argument('--key', type=int, default=0)
     parser.add_argument('--out-box-size', type=float, default=200.0,
