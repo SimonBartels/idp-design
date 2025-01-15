@@ -23,7 +23,9 @@ jax.config.update("jax_enable_x64", True)
 mapped_wang_frenkel = vmap(utils.wang_frenkel, in_axes=(None, 0, 0, 0, 0 ,0))
 mapped_coul = vmap(utils.coul, in_axes=(None, 0, None, None, 0))
 
-def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True):
+
+def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, fully_probabilistic, deterministic_i,
+                  deterministic_j, fully_deterministic, use_gg=True):
 
     if use_gg:
         default_debye_kappa = utils.DEBYE_KAPPA_GG
@@ -40,7 +42,6 @@ def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True)
     # spring_k = 8.03 * 10 / 4.184 # FIXME: double check
     spring_k = 9.6 * 2
 
-
     # Flatten the parameter tables
     eps_flattened = list()
     sigma_flattened = list()
@@ -48,8 +49,9 @@ def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True)
     mu_flattened = list()
     rc_flattened = list()
     debye_rc_flattened = list()
-    pair_charges = list()
+    all_pair_charges = list()
     for i in range(NUM_RESIDUES):
+        pair_charges = []
         for j in range(NUM_RESIDUES):
             eps_flattened.append(eps_table[i][j])
             sigma_flattened.append(sigma_table[i][j])
@@ -60,6 +62,7 @@ def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True)
             debye_rc_flattened.append(debye_rc_table[i][j])
 
             pair_charges.append([utils.charges[i], utils.charges[j]])
+        all_pair_charges.append(pair_charges)
 
     eps_flattened = jnp.array(eps_flattened, dtype=jnp.float64)
     sigma_flattened = jnp.array(sigma_flattened, dtype=jnp.float64)
@@ -67,38 +70,118 @@ def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True)
     mu_flattened = jnp.array(mu_flattened, dtype=jnp.float64)
     rc_flattened = jnp.array(rc_flattened, dtype=jnp.float64)
     debye_rc_flattened = jnp.array(debye_rc_flattened, dtype=jnp.float64)
-    pair_charges = jnp.array(pair_charges)
-
+    all_pair_charges = jnp.array(all_pair_charges)
+    pair_charges = all_pair_charges.reshape([all_pair_charges.shape[0]*all_pair_charges.shape[1], 2])
 
     def subterms_fn(R, pseq, unbonded_nbrs=base_unbonded_nbrs, debye_kappa=default_debye_kappa):
-
         ub_i = unbonded_nbrs[:, 0]
         ub_j = unbonded_nbrs[:, 1]
         mask = jnp.array(ub_i < R.shape[0], dtype=jnp.int32)
 
-        def pairwise_unbonded(i, j):
-            ipos = R[i]
-            jpos = R[j]
+        def make_pairwise_unbonded():
+            def pairwise_unbonded(i, j):
+                ipos = R[i]
+                jpos = R[j]
 
-            r = space.distance(displacement_fn(ipos, jpos))
+                r = space.distance(displacement_fn(ipos, jpos))
 
-            iprobs = pseq[i]
-            jprobs = pseq[j]
-            all_probs = jnp.kron(iprobs, jprobs)
+                iprobs = pseq[i]
+                jprobs = pseq[j]
+                all_probs = jnp.kron(iprobs, jprobs)
 
-            wf_vals = mapped_wang_frenkel(
-                r, rc_flattened, sigma_flattened,
-                nu_flattened, mu_flattened,
-                eps_flattened)
-            wf_val = jnp.dot(all_probs, wf_vals)
+                # if i < linker_start or i >= linker_end:
+                #     aa = jnp.argmax(pseq[i])
+                #     wf_vals = mapped_wang_frenkel(
+                #         r, rc_table[aa], sigma_table[aa],
+                #         nu_table[aa], mu_table[aa],
+                #         eps_table[aa])
+                #     wf_val = jnp.dot(jprobs, wf_vals)
+                # elif j < linker_start or j >= linker_end:
+                #     aa = jnp.argmax(pseq[j])
+                #     wf_vals = mapped_wang_frenkel(
+                #         r, rc_table[aa], sigma_table[aa],
+                #         nu_table[aa], mu_table[aa],
+                #         eps_table[aa])
+                #     wf_val = jnp.dot(iprobs, wf_vals)
+                # else:
+                wf_vals = mapped_wang_frenkel(
+                    r, rc_flattened, sigma_flattened,
+                    nu_flattened, mu_flattened,
+                    eps_flattened)
+                wf_val = jnp.dot(all_probs, wf_vals)
+                #print(wf_val)
+                # TODO: It seems the line below is faster!
+                #wf_val = jnp.dot(iprobs, jnp.dot(jnp.reshape(wf_vals, [iprobs.shape[0], jprobs.shape[0]]), jprobs))
+                #print(wf_val)
 
-            coul_vals = mapped_coul(r, pair_charges,
-                                    utils.debye_relative_dielectric, debye_kappa,
-                                    debye_rc_flattened)
-            coul_val = jnp.dot(all_probs, coul_vals)
+                coul_vals = mapped_coul(r, pair_charges,
+                                        utils.debye_relative_dielectric, debye_kappa,
+                                        debye_rc_flattened)
+                coul_val = jnp.dot(all_probs, coul_vals)
+                #print(coul_val)
+                # TODO: It seems the line below is faster!
+                #coul_val = jnp.dot(iprobs, jnp.dot(jnp.reshape(coul_vals, [iprobs.shape[0], jprobs.shape[0]]), jprobs))
+                #print(coul_val)
 
-            val = wf_val + coul_val
-            return val, (wf_val, coul_val)
+                val = wf_val + coul_val
+                return val, (wf_val, coul_val)
+
+            def pairwise_unbonded_deterministic_i(i, j):
+                ipos = R[i]
+                jpos = R[j]
+
+                r = space.distance(displacement_fn(ipos, jpos))
+
+                aa = jnp.argmax(pseq[i])
+                jprobs = pseq[j]
+
+                wf_vals = mapped_wang_frenkel(
+                    r, rc_table[aa], sigma_table[aa],
+                    nu_table[aa], mu_table[aa],
+                    eps_table[aa])
+                wf_val = jnp.dot(jprobs, wf_vals)
+                #print(wf_val)
+                # TODO: It seems the line below is faster!
+                #wf_val = jnp.dot(iprobs, jnp.dot(jnp.reshape(wf_vals, [iprobs.shape[0], jprobs.shape[0]]), jprobs))
+                #print(wf_val)
+
+                coul_vals = mapped_coul(r, all_pair_charges[aa],
+                                        utils.debye_relative_dielectric, debye_kappa,
+                                        debye_rc_table[aa])
+                coul_val = jnp.dot(jprobs, coul_vals)
+                # TODO: implement for real implementation!
+                coul_val = wf_val
+                #print(coul_val)
+                # TODO: It seems the line below is faster!
+                #coul_val = jnp.dot(iprobs, jnp.dot(jnp.reshape(coul_vals, [iprobs.shape[0], jprobs.shape[0]]), jprobs))
+                #print(coul_val)
+
+                val = wf_val + coul_val
+                return val, (wf_val, coul_val)
+
+            def pairwise_unbonded_deterministic(i, j):
+                ipos = R[i]
+                jpos = R[j]
+
+                r = space.distance(displacement_fn(ipos, jpos))
+
+                aa = jnp.argmax(pseq[i])
+                aa_ = jnp.argmax(pseq[j])
+
+                wf_val = utils.wang_frenkel(
+                    r, rc_table[aa, aa_], sigma_table[aa, aa_],
+                    nu_table[aa, aa_], mu_table[aa, aa_],
+                    eps_table[aa, aa_])
+
+                coul_val = utils.coul(r, [utils.charges[aa], utils.charges[aa_]],
+                                        utils.debye_relative_dielectric, debye_kappa,
+                                        debye_rc_table[aa, aa_])
+
+                val = wf_val + coul_val
+                return val, (wf_val, coul_val)
+
+            return pairwise_unbonded, pairwise_unbonded_deterministic_i, pairwise_unbonded_deterministic
+        pairwise_unbonded, pairwise_unbonded_deterministic_i, pairwise_unbonded_deterministic = make_pairwise_unbonded()
 
         def pairwise_bonded(i, j):
             ipos = R[i]
@@ -109,16 +192,25 @@ def get_energy_fn(bonded_nbrs, base_unbonded_nbrs, displacement_fn, use_gg=True)
             return utils.harmonic_spring(r, r0=utils.spring_r0, k=spring_k)
 
         total_bonded_val = jnp.sum(vmap(pairwise_bonded)(bonded_nbrs[:, 0], bonded_nbrs[:, 1]))
-        all_unbonded_vals, (wf_val, coul_val) = vmap(pairwise_unbonded)(unbonded_nbrs[:, 0], unbonded_nbrs[:, 1])
+        #return total_bonded_val, (total_bonded_val, None, None, None)
 
-        total_unbonded_val = jnp.where(mask, all_unbonded_vals, 0.0).sum()
-        # total_unbonded_val = jnp.sum(all_unbonded_vals)
+        #all_unbonded_vals, (wf_val, coul_val) = vmap(pairwise_unbonded)(unbonded_nbrs[:, 0], unbonded_nbrs[:, 1])
+        all_unbonded_vals, (wf_val, coul_val) = vmap(pairwise_unbonded)(fully_probabilistic[:, 0], fully_probabilistic[:, 1])
+        all_unbonded_vals_i, (wf_val_, coul_val_) = vmap(pairwise_unbonded_deterministic_i)(deterministic_i[:, 0], deterministic_i[:, 1])
+        all_unbonded_vals_j, (wf_val_, coul_val_) = vmap(pairwise_unbonded_deterministic_i)(deterministic_j[:, 1], deterministic_j[:, 0])
+        all_unbonded_vals_, (wf_val_, coul_val_) = vmap(pairwise_unbonded_deterministic)(fully_deterministic[:, 0], fully_deterministic[:, 1])
+        total_unbonded_val = jnp.sum(all_unbonded_vals) + jnp.sum(all_unbonded_vals_i) + jnp.sum(all_unbonded_vals_j) + jnp.sum(all_unbonded_vals_)
+        total_wf_val = None
+        total_coul_val = None
+        # TODO: reapply mask!
+        #total_unbonded_val = jnp.where(mask, all_unbonded_vals, 0.0).sum()
+        ## total_unbonded_val = jnp.sum(all_unbonded_vals)
 
-        # total_wf_val = jnp.sum(wf_val)
-        total_wf_val = jnp.where(mask, wf_val, 0.0).sum()
+        ## total_wf_val = jnp.sum(wf_val)
+        #total_wf_val = jnp.where(mask, wf_val, 0.0).sum()
 
-        # total_coul_val = jnp.sum(coul_val)
-        total_coul_val = jnp.where(mask, coul_val, 0.0).sum()
+        ## total_coul_val = jnp.sum(coul_val)
+        #total_coul_val = jnp.where(mask, coul_val, 0.0).sum()
 
         total_energy = total_bonded_val + total_unbonded_val
 

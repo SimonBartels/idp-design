@@ -1,4 +1,7 @@
 #import pdb
+import pickle
+import shutil
+
 import numpy as onp
 #import pandas as pd
 import itertools
@@ -89,15 +92,26 @@ def run(args):
     p0 = jax.nn.one_hot(first_domain, len(AA))
     p1 = jax.nn.one_hot(second_domain, len(AA))
 
-    def logits_to_full_prob(logits, temp, norm_key):
-        #gumbel_weights = jax.random.gumbel(norm_key, logits.shape)
-        # pseq = jax.nn.softmax((logits + gumbel_weights) / temp)
-        pseq = jax.nn.softmax(logits / temp)
-        pseq = jax.numpy.concatenate([p0, pseq, p1], axis=0)
-        return pseq
+    def make_logits_to_full_prob():
+        def logits_to_full_prob(logits, temp, norm_key):
+            #gumbel_weights = jax.random.gumbel(norm_key, logits.shape)
+            # pseq = jax.nn.softmax((logits + gumbel_weights) / temp)
+            pseq = jax.nn.softmax(logits / temp)
+            pseq = jax.numpy.concatenate([p0, pseq, p1], axis=0)
+            return pseq
+        return logits_to_full_prob
+
+    logits_to_full_prob = make_logits_to_full_prob()
 
     output_basedir = Path(args['output_basedir'])
     run_dir = output_basedir / run_name
+
+    if run_name == "bla":
+        try:
+            shutil.rmtree(run_dir)
+        except:
+            pass
+
     run_dir.mkdir(parents=False, exist_ok=False)
 
     ref_traj_dir = run_dir / "ref_traj"
@@ -135,12 +149,28 @@ def run(args):
 
     unbonded_nbrs_set = set([tuple(pr) for pr in onp.array(unbonded_nbrs)])
     bonded_nbrs_set = set([tuple(pr) for pr in onp.array(bonded_nbrs)])
+    unbonded_nbrs = set(unbonded_nbrs_set - bonded_nbrs_set)
+    linker_start = len(p0)
+    linker_end = linker_start + seq_length
+    fully_probabilistic = set([(a, b) for (a, b) in unbonded_nbrs if linker_start <= a < linker_end and linker_start <= b < linker_end])
+    remainder = unbonded_nbrs - fully_probabilistic
+    deterministic_i = set([(a, b) for (a, b) in remainder if (a < linker_start or a >= linker_end) and linker_start <= b < linker_end])
+    remainder = remainder - deterministic_i
+    deterministic_j = set([(a, b) for (a, b) in remainder if (b < linker_start or b >= linker_end) and linker_start <= a < linker_end])
+    remainder = remainder - deterministic_j
+    fully_deterministic = remainder
+    fully_probabilistic = jnp.array(list(fully_probabilistic))
+    deterministic_i = jnp.array(list(deterministic_i))
+    deterministic_j = jnp.array(list(deterministic_j))
+    fully_deterministic = jnp.array(list(fully_deterministic))
+
+    #remainder = jnp.array(list(remainder))
     unbonded_nbrs = jnp.array(list(unbonded_nbrs_set - bonded_nbrs_set))
 
 
     displacement_fn, shift_fn = space.free()
 
-    subterms_fn, energy_fn = get_energy_fn(bonded_nbrs, unbonded_nbrs, displacement_fn)
+    subterms_fn, energy_fn = get_energy_fn(bonded_nbrs, unbonded_nbrs, displacement_fn, fully_probabilistic, deterministic_i, deterministic_j, fully_deterministic)
     energy_fn = jit(energy_fn)
     mapped_energy_fn = vmap(energy_fn, (0, None)) # To evaluate a set of states for a given pseq
 
@@ -206,9 +236,14 @@ def run(args):
         end = time.time()
         print(f"- Batched simulation took {end - start} seconds")
         # TODO: it does not seem like the statement below is doing anything but it's taking very long...
-        #sample_traj = utils.tree_stack(sample_traj)
 
-        utils.dump_pos(sample_traj, iter_dir / "traj.pos", box_size=out_box_size)
+        f = open(iter_dir / "traj.pos", "wb")
+        pickle.dump(sample_traj, f)
+        f.close()
+
+        sample_traj = utils.tree_stack(sample_traj)
+
+        #utils.dump_pos(sample_traj, iter_dir / "traj.pos", box_size=out_box_size)
 
         sample_rgs = vmap(objective_func, (0, None))(sample_traj, displacement_fn)
         mean_rg = onp.mean(sample_rgs)
@@ -272,10 +307,14 @@ def run(args):
         pseq = logits_to_full_prob(logits, temp, norm_key)
 
         energy_scan_fn = lambda state, ts: (None, energy_fn(ts, pseq=pseq))
+        start = time.time()
         _, new_energies = scan(energy_scan_fn, None, ref_states)
+        jax.debug.print(f"- Evaluating energy function took {time.time() - start} seconds")
         # new_energies = mapped_energy_fn(ref_states, pseq)
 
+        start = time.time()
         weights, n_eff = utils.compute_weights(ref_energies, new_energies, beta)
+        jax.debug.print(f"- Computing weights took {time.time() - start} seconds")
         weighted_rgs = weights * ref_rgs # element-wise multiplication
         expected_rg = jnp.sum(weighted_rgs)
 
@@ -330,8 +369,16 @@ def run(args):
     num_resample_iters = 0
     for i in tqdm(range(n_iters), desc="Iteration"):
         key, loss_key = random.split(key)
+        start = time.time()
         (loss, aux), grads = grad_fn(params, ref_states, ref_energies, ref_rgs, gumbel_temps[i], loss_key)
+        end = time.time()
+        print(f"- Evaluating gradient took {end - start} seconds")
+        start = time.time()
         n_eff = aux[0]
+        should_resample = n_eff < min_n_eff
+        print(should_resample)
+        end = time.time()
+        print(f"- Evaluating result {end - start} seconds")
         num_resample_iters += 1
 
         if n_eff < min_n_eff or num_resample_iters > max_approx_iters:
@@ -359,45 +406,49 @@ def run(args):
             # plt.savefig(img_dir / f"convergence_i{i}.png")
             # plt.clf()
 
+            start = time.time()
             (loss, aux), grads = grad_fn(params, ref_states, ref_energies, ref_rgs, gumbel_temps[i], loss_key)
+            end = time.time()
+            print(f"- Evaluating gradient took {end - start} seconds")
+
         (n_eff, expected_rg, pseq) = aux
 
-        with open(loss_path, "a") as f:
-            f.write(f"{loss}\n")
-        with open(entropy_path, "a") as f:
-            pos_entropies = jnp.mean(jsp.special.entr(pseq), axis=1)
-            avg_pos_entropy = onp.mean(pos_entropies)
-            f.write(f"{avg_pos_entropy}\n")
-        with open(temp_path, "a") as f:
-            f.write(f"{gumbel_temps[i]}\n")
-        with open(neff_path, "a") as f:
-            f.write(f"{n_eff}\n")
-        with open(grads_path, "a") as f:
-            logits_grads = grads['logits']
-            f.write(f"{pprint.pformat(logits_grads)}\n")
-        with open(rg_path, "a") as f:
-            f.write(f"{expected_rg}\n")
-        key, alba_key = random.split(key)
-        # curr_alba_rg, _ = get_alba_rg(pseq, 1000, alba_key)
-        # with open(alba_rg_path, "a") as f:
-        #     f.write(f"{curr_alba_rg}\n")
+        # with open(loss_path, "a") as f:
+        #     f.write(f"{loss}\n")
+        # with open(entropy_path, "a") as f:
+        #     pos_entropies = jnp.mean(jsp.special.entr(pseq), axis=1)
+        #     avg_pos_entropy = onp.mean(pos_entropies)
+        #     f.write(f"{avg_pos_entropy}\n")
+        # with open(temp_path, "a") as f:
+        #     f.write(f"{gumbel_temps[i]}\n")
+        # with open(neff_path, "a") as f:
+        #     f.write(f"{n_eff}\n")
+        # with open(grads_path, "a") as f:
+        #     logits_grads = grads['logits']
+        #     f.write(f"{pprint.pformat(logits_grads)}\n")
+        # with open(rg_path, "a") as f:
+        #     f.write(f"{expected_rg}\n")
+        # key, alba_key = random.split(key)
+        # # curr_alba_rg, _ = get_alba_rg(pseq, 1000, alba_key)
+        # # with open(alba_rg_path, "a") as f:
+        # #     f.write(f"{curr_alba_rg}\n")
 
         all_rgs.append(expected_rg)
 
-        pseq_fpath = pseq_dir / f"pseq_i{i}.npy"
-        jnp.save(pseq_fpath, pseq, allow_pickle=False)
-
-        logits_fpath = logits_dir / f"logits_i{i}.npy"
-        jnp.save(logits_fpath, params['logits'], allow_pickle=False)
+        # pseq_fpath = pseq_dir / f"pseq_i{i}.npy"
+        # jnp.save(pseq_fpath, pseq, allow_pickle=False)
+        #
+        # logits_fpath = logits_dir / f"logits_i{i}.npy"
+        # jnp.save(logits_fpath, params['logits'], allow_pickle=False)
 
         max_residues = jnp.argmax(pseq, axis=1)
         argmax_seq = ''.join([utils.RES_ALPHA[res_idx] for res_idx in max_residues])
         with open(argmax_seq_path, "a") as f:
             f.write(f"{argmax_seq}\n")
 
-        argmax_seq_scaled = ''.join([argmax_seq[r_idx].lower() if pseq[r_idx, max_residues[r_idx]] < 0.5 else argmax_seq[r_idx] for r_idx in range(len(argmax_seq))])
-        with open(argmax_seq_scaled_path, "a") as f:
-            f.write(f"{argmax_seq_scaled}\n")
+        # argmax_seq_scaled = ''.join([argmax_seq[r_idx].lower() if pseq[r_idx, max_residues[r_idx]] < 0.5 else argmax_seq[r_idx] for r_idx in range(len(argmax_seq))])
+        # with open(argmax_seq_scaled_path, "a") as f:
+        #     f.write(f"{argmax_seq_scaled}\n")
 
         # if i % plot_every == 0 and i:
         #     entropies = jnp.mean(jsp.special.entr(pseq), axis=1)
@@ -416,8 +467,15 @@ def run(args):
 
         print(f"Loss: {loss}")
 
+        start = time.time()
         updates, opt_state = optimizer.update(grads, opt_state, params)
+        end = time.time()
+        print(f"- Optimizer update step took {end - start} seconds")
+
+        start = time.time()
         params = optax.apply_updates(params, updates)
+        end = time.time()
+        print(f"- Applying update took {end - start} seconds")
 
     pseq_fpath = pseq_dir / f"pseq_final.npy"
     jnp.save(pseq_fpath, pseq, allow_pickle=False)
@@ -457,29 +515,29 @@ def get_parser():
                         help="End temperature for gumbel softmax")
 
     # Simulation arguments
-    # parser.add_argument('--key', type=int, default=0)
-    # parser.add_argument('--out-box-size', type=float, default=200.0,
-    #                     help="Length of the box for injavis visualization")
-    # parser.add_argument('--n-sims', type=int, default=2,
-    #                     help="Number of independent simulations")
-    # parser.add_argument('--n-eq-steps', type=int, default=10,
-    #                     help="Number of equilibration steps")
-    # parser.add_argument('--n-sample-steps', type=int, default=50,
-    #                     help="Number of steps from which to sample states")
-    # parser.add_argument('--sample-every', type=int, default=5,
-    #                     help="Frequency of sampling reference states.")
-    # parser.add_argument('--kt', type=float, default=300*utils.kb,
-    #                     help="Temperature")
-    # parser.add_argument('--dt', type=float, default=0.2,
-    #                     help="Time step")
-    # parser.add_argument('--gamma', type=float, default=0.001,
-    #                     help="Friction coefficient for Langevin integrator")
-    #
-    # parser.add_argument('--maximize-rg', action='store_true',
-    #                     help="If true, just try to maximize Rg")
-    # parser.add_argument('--minimize-rg', action='store_true',
-    #                     help="If true, just try to minimize Rg")
-    # return parser
+    parser.add_argument('--key', type=int, default=0)
+    parser.add_argument('--out-box-size', type=float, default=200.0,
+                        help="Length of the box for injavis visualization")
+    parser.add_argument('--n-sims', type=int, default=2,
+                        help="Number of independent simulations")
+    parser.add_argument('--n-eq-steps', type=int, default=10,
+                        help="Number of equilibration steps")
+    parser.add_argument('--n-sample-steps', type=int, default=50,
+                        help="Number of steps from which to sample states")
+    parser.add_argument('--sample-every', type=int, default=5,
+                        help="Frequency of sampling reference states.")
+    parser.add_argument('--kt', type=float, default=300*utils.kb,
+                        help="Temperature")
+    parser.add_argument('--dt', type=float, default=0.2,
+                        help="Time step")
+    parser.add_argument('--gamma', type=float, default=0.001,
+                        help="Friction coefficient for Langevin integrator")
+
+    parser.add_argument('--maximize-rg', action='store_true',
+                        help="If true, just try to maximize Rg")
+    parser.add_argument('--minimize-rg', action='store_true',
+                        help="If true, just try to minimize Rg")
+    return parser
     # Simulation arguments
     parser.add_argument('--key', type=int, default=0)
     parser.add_argument('--out-box-size', type=float, default=200.0,
